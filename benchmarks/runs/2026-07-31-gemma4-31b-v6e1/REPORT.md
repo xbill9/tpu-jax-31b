@@ -794,11 +794,12 @@ the other two may also be schedule-level rather than fundamental.
 
 ---
 
-# Addendum 7: ⚠️ prefill logits depend on KV buffer SIZE — an open correctness bug
+# Addendum 7: KV buffer size changes prefill logits — numerical, not a logic bug
 
-**Found 2026-08-01 on a spot v6e-1 (us-central1-a) while validating the Addendum 6
-donation fix end to end. This is the most serious finding in this report and it is
-NOT resolved.**
+**RESOLVED, and the first version of this section was wrong.** It was written as
+"an open correctness bug ... the most serious finding in this report" and committed
+in that form. Two follow-up measurements retracted it. The measurements below are
+kept because the *sensitivity* is real and worth knowing; the alarm was not.
 
 ## What was measured
 
@@ -827,58 +828,57 @@ top-1 token.
 | `window_kv=True` | **237221** | **argmax MATCHES** |
 | `window_kv=False` | 759 | argmax differs |
 
-## Why this matters
+## The two measurements that resolved it
 
-`prefill_with_kv_cache`'s own docstring says prefill "attends over the freshly
-computed K/V (S keys), not the padded cache". If that were true, **the buffer's size
-would be unobservable in the logits.** It is not.
+**(3) Tiny-scale CPU reproduction — `tests/test_kv_buffer_size_invariance.py`:
+6/6 PASS.** At 4 layers with an fp32 cache there is no buffer-size dependence at
+all, to within 1e-5. A logic bug in shared engine code would have reproduced here.
 
-The good news for this report: `jax_engine.py` auto-enables `window_kv` whenever
-`max_model_len > sliding_window`, so the **default serving path is `window_kv=True`,
-which is the mode that agrees with the cache-free reference.** Every benchmark in
-this report ran with `window_kv=True`, and every parity/generation check used prompts
-of ~20 tokens, far below the 1024 window, where the two modes are identical anyway.
-So the timings and the "answers correctly" results stand.
+**(4) The same TPU A/B with a REAL prompt** instead of random tokens (chat-templated
+and repeated to 1024 tokens so the window binds):
 
-The bad news: **`window_kv=False` is exactly what `chunked_prefill_with_kv_cache`
-requires.** The chunked path is hard-wired to the mode that disagrees with ground
-truth. That reframes Addendum 6 — the donation fix is real and made the path
-*compile*, but the path it makes viable is numerically suspect, and the 18.7%
-chunked-vs-one-shot gap first observed was this same discrepancy inherited through
-the reference, not a chunking error.
+| | top-1 | |
+| :--- | ---: | :--- |
+| `window_kv=False` | 624 `'and'` | |
+| `window_kv=True` | 624 `'and'` | **MATCH** |
 
-## What is NOT established — do not act on a guess
+`max|diff| = 0.6887` (rel 3.0%), **top-1-to-top-2 margin = 1.565**. The divergence
+is well under the margin, so the argmax is stable.
 
-- **The mechanism.** Reading the attention cache branch, the prefill path
-  (`S > 1`, not chunked) does not reassign `k`/`v`; it only builds
-  `kv_out_override` via `_ring_store`. Buffer size should be unobservable. It is
-  observable. I could not find the path by which it leaks, and three earlier
-  root-cause guesses in this report were wrong.
-- **Which mode is correct in absolute terms.** `window_kv=True` matches the
-  no-cache argmax, but `max|diff|` against no-cache is large in *both* modes
-  (7.29 and 9.13), which is itself unexplained. Argmax agreement is not proof of
-  correctness.
-- **Whether this is 31B-specific.** It is in shared engine code, so E2B and the 12B
-  may be affected. `tests/test_windowed_kv.py` and `tests/test_kv_cache_parity.py`
-  pass on CPU with small models, so whatever this is, the existing tests do not
-  catch it.
+## What was actually going on
 
-## Recommended first step
+Different buffer sizes produce different HLO, therefore different fusion and
+accumulation order, therefore ~3% bf16 divergence accumulated over 60 layers. That
+is ordinary floating-point non-associativity, not a leak of cache contents into the
+attention.
 
-Reproduce at tiny scale on CPU — same random-weight model, S just above and below
-the window, `window_kv` on/off, plus a `kv_caches=None` control — and turn it into a
-failing test before touching any code. If it does not reproduce on CPU at small
-scale, that is itself the clue.
+**The 12% / flipped-argmax result came from using random-token prompts.** Those are
+far out of distribution: the logits are near-flat, top-1 margins are ~0, and any
+reordering flips the argmax. The measurement was correct; the interpretation was
+not. At S=512 the two configurations compile to the *same* HLO (identical buffers),
+which is why they agreed bitwise — that was the clue, and it was misread as
+evidence of a bug rather than evidence of a compilation difference.
+
+## What remains true and worth knowing
+
+- **Greedy decoding is not bit-reproducible across `window_kv` settings**, and on
+  out-of-distribution input the sampled token can genuinely differ. Anyone doing
+  A/B evaluation must hold `window_kv` fixed.
+- **Never benchmark correctness on random tokens.** A flat-logit prompt makes
+  argmax comparison meaningless and manufactured a false alarm here.
+- The invariance test is retained as a regression guard: it encodes the property
+  that *should* hold, and it would catch the real bug this was mistaken for.
 
 ---
 
 ## Next actions, in order
 
-0. **⚠️ FIRST: the KV-buffer-size dependence in Addendum 7.** Prefill logits change
-   by 12% when the KV buffer gains eight unused slots. It is a correctness bug in
-   shared engine code, it is unexplained, and it makes the chunked path's required
-   mode (`window_kv=False`) the one that disagrees with a cache-free reference.
-   Everything below is performance work and should wait behind it.
+0. ~~The KV-buffer-size dependence in Addendum 7.~~ **RESOLVED — not a bug.** It is
+   fusion-order divergence (~3% in bf16 over 60 layers), and the alarming 12% /
+   flipped-argmax reading came from benchmarking correctness on random tokens.
+   `tests/test_kv_buffer_size_invariance.py` is retained as a regression guard.
+   Standing rule it produced: **hold `window_kv` fixed across any A/B, and never
+   judge correctness on out-of-distribution prompts.**
 
 1. ~~Slice the hidden state before the lm_head in prefill.~~ **DONE — see addendum.**
    Mathematically exact (not bitwise on TPU), worth ~21.7 GiB at B=2 x 2K and
