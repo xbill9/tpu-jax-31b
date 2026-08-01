@@ -9,6 +9,12 @@ slow way first; the rest were found by diffing.
 Status legend: **✅ verified** against the reference · **⚠️ inferred** from shapes or
 measurement only.
 
+
+> **See also:** [`gemma4-31b-quirks.md`](gemma4-31b-quirks.md) — what the **31B**
+> does differently, plus the W4A16 checkpoint format, XLA-on-v6e behaviour, and a
+> section on how the measurements lie. This document is E2B and architecture;
+> that one is scale, format and method.
+
 ---
 
 ## 1. The checkpoint is multimodal ✅

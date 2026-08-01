@@ -304,6 +304,72 @@ signal, so any such reading is a decoder bug, never a model property.
 
 ---
 
+## 9. The sink is reachable by 10 layers out of 60 — and that explains §4
+
+§7 found the massive activations on positions 0–1. §4 found the full-attention
+layers producing 33–37% larger outputs and damped 14% harder. Those are the same
+fact, and `ports/gemma4/jax_31b_sink_reach.py` closes the loop.
+
+**A sliding layer is masked to `(p − 1024, p]` regardless of `window_kv`.** The ring
+buffer is a memory optimization; the mask is the semantics. So once a prompt passes
+1024 tokens, **50 of the 60 layers cannot attend to position 0 at all** — not
+"evicted", simply outside the window. Only the 10 full-attention layers can reach it.
+
+Attention mass on positions 0–1 for the **last** query at a 1536-token prompt:
+
+| | mean sink mass | top key is the sink |
+| :--- | ---: | ---: |
+| sliding (50 layers) | **0.000000** | — |
+| full (10 layers) | **0.236535** | **70%** |
+
+Across all 50 sliding layers the maximum sink mass is **exactly 0.0**. They peak
+instead on keys 1534/1535 — the most recent tokens.
+
+Full-attention layers by depth:
+
+| layer | 5 | 11 | 17 | 23 | 29 | 35 | 41 | 47 | 53 | 59 |
+| :--- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| sink mass | 0.346 | **0.440** | 0.379 | 0.225 | 0.177 | 0.191 | 0.115 | 0.091 | 0.102 | **0.299** |
+
+Layer 11 spends **44% of its entire attention budget on the first two tokens**. The
+pattern is front-loaded, tapers through the middle, and rebounds at layer 59 — the
+final layer, which is also a full-attention layer.
+
+### One mechanism, three findings
+
+1. Massive activations park on positions 0–1 (§7).
+2. Sliding layers are windowed to 1024 and structurally cannot see them at long
+   context.
+3. Full-attention layers can, and spend ~24% of their attention there.
+4. Which is why they produce larger outputs and are damped harder (§4): **they are
+   the model's only sink pathway, and its only long-range pathway, at any context
+   beyond 1024 tokens.**
+
+### The design tension this exposes
+
+The sink pathway runs through the **narrowest KV in the model**. Full-attention
+layers have **4** KV heads to the sliding layers' 16, and `attention_k_eq_v` (V is
+K, no `v_proj` at all). The most load-bearing attention in the network is also the
+most parameter-starved. That is presumably deliberate — 10 layers × 4 heads is what
+makes 128K context affordable — but it means those 10 layers have no slack.
+
+### Practical consequences
+
+- **Windowing the sliding layers' KV is provably safe.** They cannot attend outside
+  the window regardless, so a 1024-slot ring drops only slots the mask already
+  excluded. This settles the concern raised at the end of §7 and supports the
+  memory work in `REPORT.md` — with the caveat that chunked prefill still needs the
+  `window + chunk` sizing derived in Addendum 6.
+- **Never evict positions 0–1 from the FULL-attention layers' cache.** For those 10
+  layers the sink is up to 44% of the attention distribution. Sliding layers are
+  indifferent.
+- **Be careful quantizing the full layers' KV.** They carry the sink, they have 4
+  heads of it, and there is no redundancy. If a mixed-precision KV scheme is ever
+  worth doing here, this is the split that matters — not the per-projection split
+  §5 suggested and §8 refuted.
+
+---
+
 ## Reproduce
 
 ```bash
