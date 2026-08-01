@@ -1,0 +1,26 @@
+KV-buffer-size dependence in prefill logits — gemma-4-31B-it-qat-w4a16-ct, v6e-1 spot, 2026-08-01
+Random-token prompts, greedy, w4a16, bf16 cache. prefill_with_kv_cache only (NO chunking).
+
+(1) window_kv=False vs window_kv=True, same one-shot prefill:
+  S      sliding buf F/T     max|diff|   rel      argmax match
+   512   520 / 520            0.00000    0.00e+00  YES  (buffers identical)
+  1024   1032 / 1024          2.41263    1.20e-01  NO
+  2048   2056 / 1024          3.54227    1.36e-01  NO
+
+  At S=1024 the two buffers differ by EIGHT slots and both take the same
+  `S <= buf_len` store path, yet the logits move 12%.
+
+(2) Ground truth = same model, kv_caches=None (no cache at all), S=1024:
+  no-cache            top1 = 237221
+  window_kv=True      top1 = 237221   MATCH      max|diff| 7.29
+  window_kv=False     top1 = 759      MISMATCH   max|diff| 9.13
+
+CONCLUSION: prefill logits depend on the KV buffer's size, which they must not —
+the docstring states prefill attends over the freshly computed K/V, not the cache.
+window_kv=True agrees with the cache-free reference on argmax; window_kv=False
+does not. Chunked prefill REQUIRES window_kv=False.
+
+NOT ESTABLISHED: the mechanism. Reading the attention cache branch, prefill does
+not reassign k/v (it only builds kv_out_override via _ring_store), so buffer size
+should be unobservable. The large max|diff| against no-cache in BOTH modes is also
+unexplained. Do not act on a guessed cause.

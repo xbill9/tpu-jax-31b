@@ -794,7 +794,91 @@ the other two may also be schedule-level rather than fundamental.
 
 ---
 
+# Addendum 7: ⚠️ prefill logits depend on KV buffer SIZE — an open correctness bug
+
+**Found 2026-08-01 on a spot v6e-1 (us-central1-a) while validating the Addendum 6
+donation fix end to end. This is the most serious finding in this report and it is
+NOT resolved.**
+
+## What was measured
+
+`prefill_with_kv_cache` only — no chunking involved. Random-token prompts, greedy,
+w4a16, bf16 cache.
+
+**(1) `window_kv=False` vs `window_kv=True`, identical input:**
+
+| S | sliding buf F/T | max abs diff | rel | argmax match |
+| ---: | :--- | ---: | ---: | :--- |
+| 512 | 520 / 520 | **0.00000** | 0 | yes (buffers identical) |
+| 1024 | 1032 / **1024** | 2.41263 | 12.0% | **no** |
+| 2048 | 2056 / 1024 | 3.54227 | 13.6% | **no** |
+
+At S=512 the two configurations allocate the *same* buffer and agree **bitwise** —
+so the harness is sound and the computation is deterministic. At S=1024 the buffers
+differ by **eight slots**, both take the same `S <= buf_len` store path (a plain
+`dynamic_update_slice` at offset 0), and the logits move **12%** with a different
+top-1 token.
+
+**(2) Ground truth — the same model with `kv_caches=None`, S=1024:**
+
+| path | top-1 | vs no-cache |
+| :--- | ---: | :--- |
+| no cache (reference) | 237221 | — |
+| `window_kv=True` | **237221** | **argmax MATCHES** |
+| `window_kv=False` | 759 | argmax differs |
+
+## Why this matters
+
+`prefill_with_kv_cache`'s own docstring says prefill "attends over the freshly
+computed K/V (S keys), not the padded cache". If that were true, **the buffer's size
+would be unobservable in the logits.** It is not.
+
+The good news for this report: `jax_engine.py` auto-enables `window_kv` whenever
+`max_model_len > sliding_window`, so the **default serving path is `window_kv=True`,
+which is the mode that agrees with the cache-free reference.** Every benchmark in
+this report ran with `window_kv=True`, and every parity/generation check used prompts
+of ~20 tokens, far below the 1024 window, where the two modes are identical anyway.
+So the timings and the "answers correctly" results stand.
+
+The bad news: **`window_kv=False` is exactly what `chunked_prefill_with_kv_cache`
+requires.** The chunked path is hard-wired to the mode that disagrees with ground
+truth. That reframes Addendum 6 — the donation fix is real and made the path
+*compile*, but the path it makes viable is numerically suspect, and the 18.7%
+chunked-vs-one-shot gap first observed was this same discrepancy inherited through
+the reference, not a chunking error.
+
+## What is NOT established — do not act on a guess
+
+- **The mechanism.** Reading the attention cache branch, the prefill path
+  (`S > 1`, not chunked) does not reassign `k`/`v`; it only builds
+  `kv_out_override` via `_ring_store`. Buffer size should be unobservable. It is
+  observable. I could not find the path by which it leaks, and three earlier
+  root-cause guesses in this report were wrong.
+- **Which mode is correct in absolute terms.** `window_kv=True` matches the
+  no-cache argmax, but `max|diff|` against no-cache is large in *both* modes
+  (7.29 and 9.13), which is itself unexplained. Argmax agreement is not proof of
+  correctness.
+- **Whether this is 31B-specific.** It is in shared engine code, so E2B and the 12B
+  may be affected. `tests/test_windowed_kv.py` and `tests/test_kv_cache_parity.py`
+  pass on CPU with small models, so whatever this is, the existing tests do not
+  catch it.
+
+## Recommended first step
+
+Reproduce at tiny scale on CPU — same random-weight model, S just above and below
+the window, `window_kv` on/off, plus a `kv_caches=None` control — and turn it into a
+failing test before touching any code. If it does not reproduce on CPU at small
+scale, that is itself the clue.
+
+---
+
 ## Next actions, in order
+
+0. **⚠️ FIRST: the KV-buffer-size dependence in Addendum 7.** Prefill logits change
+   by 12% when the KV buffer gains eight unused slots. It is a correctness bug in
+   shared engine code, it is unexplained, and it makes the chunked path's required
+   mode (`window_kv=False`) the one that disagrees with a cache-free reference.
+   Everything below is performance work and should wait behind it.
 
 1. ~~Slice the hidden state before the lm_head in prefill.~~ **DONE — see addendum.**
    Mathematically exact (not bitwise on TPU), worth ~21.7 GiB at B=2 x 2K and
