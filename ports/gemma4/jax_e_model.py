@@ -1369,6 +1369,22 @@ def make_chunked_prefill_step(model: Gemma4EModelJAX, chunk_size: int,
     The cache must be full-length (window_kv=False): a chunk writes `chunk_size`
     contiguous slots at an arbitrary offset, which a shorter ring buffer would
     wrap. Sliding layers still get their window through the mask.
+
+    IF YOU MAKE THIS WORK WITH A RING BUFFER, size it `sliding_window + chunk_size`
+    — NOT `sliding_window`. A chunk's queries span absolute positions
+    [slot, slot + chunk), and each attends back `window`, so the chunk collectively
+    reads `(slot - window, slot + chunk)` = window + chunk - 1 positions. A ring of
+    exactly `window` is filled by the current chunk alone and destroys the previous
+    chunk's keys before the chunk's early rows read them: rows near the chunk start
+    silently lose up to window-1 positions of history. That version compiles, runs,
+    and computes the wrong thing. At `window + chunk` the entries a write evicts are
+    exactly those no query in the chunk can reach, so plain `p % buf_len` indexing
+    is correct.
+
+    Motivation for bothering: the 8192 prefill cliff on the 31B is driven by the KEY
+    extent, not the query count — chunk sizes 128/256/1024 all require ~32.4-33.0
+    GiB (measured). A 1280-slot ring would cut the sliding layers' key extent 6.4x.
+    See benchmarks/runs/2026-07-31-gemma4-31b-v6e1/REPORT.md, Addendum 6.
     """
     window = model.config.sliding_window
 

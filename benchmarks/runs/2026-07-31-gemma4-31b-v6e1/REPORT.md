@@ -839,24 +839,42 @@ and a long-context one, and it is the smallest remaining gap in this report.
 
 `chunked_prefill_with_kv_cache` hard-requires `window_kv=False`, and
 `jax_engine.py` explains why: "a chunk writes contiguous slots at an arbitrary
-offset that a shorter ring buffer would wrap." True in general — but **if
-`chunk_size` equals `sliding_window`, every chunk starts at `start % window == 0`
-and writes exactly one full ring period.** The wrap is then always exact and never
-partial, so the objection does not apply. On this model both are **1024**, so the
-special case is available for free.
+offset that a shorter ring buffer would wrap."
 
-Two things would follow at `total_len=8192`:
+**⚠️ An earlier draft of this section proposed `chunk_size == sliding_window` as the
+safe special case. That is WRONG, and dangerously so — do not implement it.** The
+wrap alignment is fine; the *history* is not:
 
-| | `window_kv=False` (today) | `window_kv=True` (proposed) |
+- a query at absolute position `p` must attend to keys in `(p - window, p]`
+- a chunk covers `p` in `[slot, slot + chunk)`, so the keys it collectively needs
+  span `(slot - window, slot + chunk)` — **`window + chunk - 1` positions**
+- with `buf_len == window == chunk`, writing the current chunk fills the entire
+  ring, **destroying the previous chunk's keys before the chunk's early rows can
+  read them**
+
+Rows near the start of each chunk would silently lose up to `window - 1` positions
+of history. It would compile, run, and compute the wrong thing — the failure mode
+this codebase keeps producing.
+
+**The correct condition is a buffer, not a chunk size:** the sliding cache must hold
+at least `window + chunk_size - 1` positions. Allocating
+`buf_len = sliding_window + chunk_size` makes plain `p % buf_len` ring indexing
+correct, because the entries a write evicts are exactly those `window + chunk`
+positions old, which no query in this chunk can reach.
+
+Two things would follow at `total_len=8192` with `chunk=256`, sliding buffers sized
+`window + chunk = 1280`:
+
+| | `window_kv=False` (today) | ring buffer of 1280 (corrected proposal) |
 | :--- | ---: | ---: |
-| KV (argument) | 7.38 GB | ~1.51 GB |
-| sliding-layer attention extent | 8192 keys | **1024 keys** |
+| KV (argument) | 7.38 GB | **~1.02 GB** |
+| sliding-layer attention extent | 8192 keys | **1280 keys** |
 
 The KV saving is in *arguments*, which does not touch the 34.80 GB temp. But the
-second column might: **50 of the 60 layers would attend over 1024 keys instead of
-8192**, an 8x reduction in the attention extent for 5/6 of the model. If the 8192
-cliff is driven by the key dimension rather than the query dimension — which the
-chunk-size test above is designed to determine — this is the change that removes it.
+second column might: **50 of the 60 layers would attend over 1280 keys instead of
+8192**, a 6.4x reduction in the attention extent for 5/6 of the model. The
+chunk-size sweep above established the 8192 cliff is key-driven, so this is the only
+identified lever on it.
 
 **Attempted, and it is NOT a guard relaxation.** Passing a windowed cache
 (`window_kv=True`, `total_len=8192`, `chunk=1024`) into `make_chunked_prefill_step`
