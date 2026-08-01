@@ -148,6 +148,92 @@ The distribution is effectively a point mass. Two consequences:
 
 ---
 
+## 7. Massive activations: 15,665x outliers on the first two tokens
+
+`ports/gemma4/jax_31b_massive_act.py`. The huge norm weights in §2 predicted a
+massive-activation structure; this is it, and it is extreme.
+
+### Runtime: where the magnitude lands
+
+Largest `|activation|` in the residual stream entering each layer, one 20-token
+chat-templated prompt:
+
+| layer | max\|h\| | ratio to median | at position | token | channel |
+| ---: | ---: | ---: | ---: | :--- | ---: |
+| 0 | 860.0 | 330 | 1 | `'<\|turn>'` | 3970 |
+| 2 | 281.0 | 2,217 | 0 | `'<bos>'` | 1682 |
+| 3 | 499.6 | 4,459 | 0 | `'<bos>'` | 1682 |
+| 10 | 788.2 | 2,678 | 0 | `'<bos>'` | 1682 |
+| 30 | 403.6 | 517 | 5 | `' is'` | 3770 |
+| 50 | 169.8 | 210 | 1 | `'<\|turn>'` | 3770 |
+| **59** | **18.33** | **32** | 4 | `'What'` | 3069 |
+
+**max/median ratio: mean 1,214x, peak 15,665x at layer 7.**
+
+**Position concentration — the attention-sink test, passed:**
+
+| position | token | layers holding the max |
+| ---: | :--- | ---: |
+| 1 | `'<\|turn>'` | **32 / 60** |
+| 0 | `'<bos>'` | **15 / 60** |
+| 5 | `' is'` | 5 / 60 |
+| 6 | `' the'` | 5 / 60 |
+
+**78% of layers put their peak activation on one of the first two tokens.**
+
+**Channel concentration:** ch3770 (23/60) and ch1682 (11/60) account for 57% of
+layers. ch1682 owns the early stack (layers 2–10), ch3770 the middle and late.
+
+Note that mean `|h|` at position 0 is only **1.3x** the other positions. The
+positions are not uniformly large — a *few channels* at those positions are
+enormous. Massive activations are sparse in (position, channel) space, which is
+exactly why a per-tensor scale cannot survive them.
+
+### The exit clamp is what tames them
+
+Layer 59 peaks at **18.33** with a ratio of 32, against ~100–800 and ratios in the
+hundreds-to-thousands everywhere else. That is §1's `layer_scalar = 0.0317` doing
+its job: **the exit clamp exists to crush the massive activations before the
+lm_head sees them.** The two findings are one mechanism.
+
+### The norm outliers and the activation outliers are DIFFERENT channels
+
+Static top channels by norm weight — pre-norms: ch1081, ch1400, ch1924, ch4206
+(recurring across both `input_layernorm` and `pre_feedforward_layernorm`);
+post-norms: a tight contiguous band at **ch33–47**, with ch39 the argmax in 12/60
+and 16/60 layers.
+
+Runtime top channels: ch3770, ch1682, ch2130, ch3067.
+
+**They do not overlap.** The high-gain norm channels and the massive-activation
+channels are separate populations, so you cannot predict one from the other — the
+norm weights are not simply amplifying the sink channels.
+
+Structural aside: 13.9% of `input_layernorm` and 23.0% of `pre_feedforward_layernorm`
+channels sit above 10x the median, versus **0.13–0.17%** for the post-norms. The
+pre-norms carry a broad heavy tail; the post-norms carry a handful of outliers in a
+narrow low index band. Two different designs in the same layer.
+
+### Practical consequences
+
+1. **Per-tensor activation quantization (e.g. A8) will not survive this model.** A
+   15,665x in-tensor dynamic range leaves nothing for the other channels.
+2. **The engine's KV quantization is already the right shape, and now there is a
+   reason.** `quantize_kv` uses **per-(batch, head, position)** scales over
+   `head_dim` (jax_e_model.py:473). Per-position granularity is precisely what
+   isolates the sink tokens; a per-tensor scale would be destroyed by them. This
+   validates the existing int8/fp8 KV support rather than merely permitting it.
+3. **Do not trim or drop the leading tokens.** `<bos>` and `<\|turn>` carry the
+   sinks for 78% of layers. Anything that truncates a prompt's head, or evicts
+   early cache slots, is removing the model's attention sink.
+4. **Windowed sliding KV is safe here only because the sinks live in the last
+   1024 positions of a short prompt.** At long context, a 1024-slot ring on the
+   sliding layers *will* evict positions 0–1. Whether those layers depend on the
+   sink is untested and is the obvious follow-up — it bears directly on the
+   long-context work in `REPORT.md`.
+
+---
+
 ## Reproduce
 
 ```bash
@@ -173,6 +259,9 @@ safetensors reader, because the `safetensors` build on a bare JAX VM cannot deco
 
 ## Artifacts
 
-- `results/gemma4_31b_model_intel.json` — static pass
+- `results/gemma4_31b_model_intel.json` — static pass (norms, layer_scalar, quant stress)
 - `results/gemma4_31b_model_intel_dyn.json` — dynamic pass, full 60-layer table
-- `logs/intel_static.log`, `logs/intel_dyn.log`
+- `results/gemma4_31b_massive_act.json` — norm channel structure
+- `results/gemma4_31b_massive_act_dyn.json` — per-layer max activation, position, channel
+- `logs/intel_static.log`, `logs/intel_dyn.log`, `logs/mact_static.log`, `logs/mact_dyn.log`
+- `jax_31b_model_intel.py`, `jax_31b_massive_act.py` — the harnesses
