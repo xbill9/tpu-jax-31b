@@ -107,17 +107,19 @@ channels within the tensor = harder for a 4-bit grid to represent.
 | gate_proj | 2.75 | 2.75 | 2.78 | 2.31 | 2.79 |
 | up_proj | 2.41 | 2.40 | 2.46 | 2.22 | 2.19 |
 
-Three things fall out:
+Three things appear to fall out — and **§8 measures the actual error and shows two of
+them are wrong.** Read this table as a description of the *scale distribution*, not
+as a prediction of quantization damage:
 
-1. **`v_proj` is the hardest tensor to quantize in the model** (4.22), and it gets
-   worse with depth (3.96 → 4.61). The `n/a` in the "full" column is not missing
-   data — it is `attention_k_eq_v`: full-attention layers **ship no `v_proj` at
-   all**. The architecture is confirmed by the absence.
-2. **Attention projections get harder with depth; the MLP does not.** q/k/v all rise
-   from early to late, while `down_proj` *falls* (3.56 → 2.42) and `up_proj` is flat.
-   If you were choosing where to spend bits, late-layer attention is the place.
-3. **MLP projections are the easiest** (`up_proj` 2.41, `gate_proj` 2.75) despite
-   being by far the largest tensors — good news, since they dominate the footprint.
+1. **`v_proj` has the widest scale dynamic range** (4.22), rising with depth
+   (3.96 → 4.61). The `n/a` in the "full" column is not missing data — it is
+   `attention_k_eq_v`: full-attention layers **ship no `v_proj` at all**. The
+   architecture is confirmed by the absence. *(This part stands.)*
+2. ~~Attention projections get harder with depth; if you were choosing where to
+   spend bits, late-layer attention is the place.~~ **Retracted — see §8.** Measured
+   error is uniform to 0.1% across all projections and layers.
+3. ~~MLP projections are the easiest despite dominating the footprint.~~
+   **Retracted — see §8.**
 
 ## 6. The model is extremely confident on real prompts
 
@@ -234,6 +236,74 @@ narrow low index band. Two different designs in the same layer.
 
 ---
 
+## 8. Measured W4A16 error: 6.67%, and flat everywhere
+
+§5's scale dynamic range is a *proxy*. `ports/gemma4/jax_31b_quant_error.py`
+measures the real thing: dequantize `-qat-w4a16-ct` and compare against
+`-qat-q4_0-unquantized`, which ships the same QAT weights in half precision.
+
+**Control first.** Those two checkpoints are QAT'd for different schemes, so they
+might be separate training runs. Every tensor that neither variant quantizes —
+all four RMSNorms at layers 0/30/59, `layer_scalar`, `final_norm`, and all 1.4B
+parameters of `embed_tokens` — is **bit-identical**. Same base model, so the
+comparison is meaningful. (Caveat: this proves the *shared* tensors match; it does
+not by itself prove the QAT-trained projections were meant to be identical. The
+6.67% result below, being exactly quantizer-shaped, is the evidence that they were.)
+
+### The result
+
+| | rel. Frobenius error | SNR |
+| :--- | ---: | ---: |
+| every projection, layers 0 / 30 / 59 | **0.0667** | **23.52 dB** |
+
+Across 20 (layer, projection) pairs: min 0.06663, max 0.06671 — a **spread of
+0.12%**.
+
+| projection | mean rel_fro |
+| :--- | ---: |
+| gate_proj | 0.06671 |
+| up_proj | 0.06671 |
+| down_proj | 0.06670 |
+| o_proj | 0.06667 |
+| q_proj | 0.06666 |
+| v_proj | 0.06665 |
+| k_proj | 0.06664 |
+
+### What this overturns
+
+**The dynamic-range proxy does not predict quantization damage.** §5 ranked
+`v_proj` hardest (4.22) and `up_proj` easiest (2.41) — a 1.75x spread — and
+concluded that late-layer attention was where extra bits would pay. Measured error
+is **flat to 0.1%**, and `v_proj` is actually among the *lowest*. Both of those
+conclusions are retracted above.
+
+The reason is that the proxy measured the spread of the *scales*, and the scales
+exist precisely to absorb that spread. With one bf16 scale per 32 input columns,
+group-32 quantization adapts to whatever local dynamic range it finds, so a wide
+scale distribution means the mechanism is working, not that it is struggling.
+
+**Practical consequence: there is no cheap win from mixed precision here.** Nothing
+in this model is disproportionately damaged by W4A16, so spending extra bits on a
+subset of projections would buy proportionally little. That is a more useful
+conclusion than the one it replaces, and the opposite of it.
+
+### How the encoding was pinned down
+
+Two wrong answers preceded this one, both caught because the number was physically
+impossible (SNR ≈ **−8 dB**, error larger than signal):
+
+1. `SafeReader` returned every tensor as float32. An `I32` word packing eight
+   nibbles routinely exceeds 2²⁴, which float32's mantissa cannot hold, so the bit
+   patterns were silently rounded. Fixed with a `get_raw` that preserves dtype.
+2. The nibbles were sign-extended as two's complement. `compressed-tensors`
+   pack-quantized uses a **biased** encoding — stored value is `value + 8`, so
+   0 → −8, 8 → 0, 15 → +7 (`jax_e_model.py:305`). Sign extension scrambles it.
+
+Negative SNR is a useful tripwire: a quantizer cannot produce error larger than
+signal, so any such reading is a decoder bug, never a model property.
+
+---
+
 ## Reproduce
 
 ```bash
@@ -251,9 +321,9 @@ safetensors reader, because the `safetensors` build on a bare JAX VM cannot deco
 - Activation figures come from **one** 20-token chat-templated prompt. Residual
   magnitudes and the confidence metrics will move with prompt length and content;
   the sliding-vs-full *ratios* are the more robust part.
-- Scale dynamic range is a proxy for quantization difficulty, not a measurement of
-  quantization error. Confirming it needs a dequantize-and-compare against the
-  `q4_0-unquantized` variant, which was not run.
+- Scale dynamic range (§5) is a proxy and it turned out NOT to predict quantization
+  damage — §8 measured the real error and retracted two of §5's conclusions. Keep
+  §5 as a description of the scale distribution only.
 - Everything here describes the **W4A16 QAT** checkpoint. The bf16 variants may
   differ, particularly in the norm outliers.
 
@@ -264,4 +334,6 @@ safetensors reader, because the `safetensors` build on a bare JAX VM cannot deco
 - `results/gemma4_31b_massive_act.json` — norm channel structure
 - `results/gemma4_31b_massive_act_dyn.json` — per-layer max activation, position, channel
 - `logs/intel_static.log`, `logs/intel_dyn.log`, `logs/mact_static.log`, `logs/mact_dyn.log`
-- `jax_31b_model_intel.py`, `jax_31b_massive_act.py` — the harnesses
+- `results/gemma4_31b_quant_error.json` — measured W4A16 error + the base-model control
+- `logs/quant_error.log`
+- `jax_31b_model_intel.py`, `jax_31b_massive_act.py`, `jax_31b_quant_error.py` — the harnesses

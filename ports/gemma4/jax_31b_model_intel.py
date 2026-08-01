@@ -79,18 +79,37 @@ class SafeReader:
         return [k for k in self.header if k != "__metadata__"]
 
     def get(self, name: str) -> np.ndarray:
+        """Tensor as float32. Lossless for BF16/F16/F32 and small ints.
+
+        DO NOT use for packed int4 words: an I32 holding eight nibbles can exceed
+        2**24, which float32's mantissa cannot represent exactly, so the bit
+        pattern is silently rounded and the nibbles are destroyed. Use
+        `get_raw` for anything whose bits matter.
+        """
         meta = self.header[name]
-        lo, hi = meta["data_offsets"]
-        raw = self._mm[self.data_start + lo: self.data_start + hi]
         dt = meta["dtype"]
         if dt == "BF16":
-            u16 = raw.view("<u2")
+            u16 = self._buf(name).view("<u2")
             f32 = (u16.astype(np.uint32) << 16).view(np.float32)
         elif dt in self._NP:
-            f32 = raw.view(self._NP[dt]).astype(np.float32)
+            f32 = self._buf(name).view(self._NP[dt]).astype(np.float32)
         else:
             raise ValueError(f"unhandled safetensors dtype {dt} for {name}")
         return f32.reshape(meta["shape"])
+
+    def _buf(self, name: str) -> np.ndarray:
+        meta = self.header[name]
+        lo, hi = meta["data_offsets"]
+        return self._mm[self.data_start + lo: self.data_start + hi]
+
+    def get_raw(self, name: str) -> np.ndarray:
+        """Tensor in its NATIVE dtype, bits preserved. BF16 is returned as uint16."""
+        meta = self.header[name]
+        dt = meta["dtype"]
+        code = "<u2" if dt == "BF16" else self._NP.get(dt)
+        if code is None:
+            raise ValueError(f"unhandled safetensors dtype {dt} for {name}")
+        return self._buf(name).view(code).reshape(meta["shape"])
 
 
 def _f32(a) -> np.ndarray:
