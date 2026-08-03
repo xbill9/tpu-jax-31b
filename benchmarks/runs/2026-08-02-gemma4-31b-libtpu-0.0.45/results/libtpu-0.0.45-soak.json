@@ -1,0 +1,61 @@
+{
+  "model": "google/gemma-4-31B-it-qat-w4a16-ct",
+  "devices": [
+    "TPU_0(process=0,(0,0,0,0))"
+  ],
+  "jax_version": "0.11.0",
+  "stages_requested": [
+    "load",
+    "sweep"
+  ],
+  "load": {
+    "load_s": 7.2,
+    "weight_gb": 19.357,
+    "hbm_in_use_gb": 19.297,
+    "hbm_limit_gb": 33.546,
+    "headroom_gb": 14.249,
+    "w4a16_impl": "reference"
+  },
+  "sweep": [
+    {
+      "B": 1,
+      "S": 512,
+      "bucket_S": 512,
+      "prefill_ms": 241.26,
+      "decode_step_ms": 78.807,
+      "agg_decode_tok_s": 12.7,
+      "per_user_tok_s": 12.7,
+      "status": "OK"
+    },
+    {
+      "B": 1,
+      "S": 1024,
+      "bucket_S": 1024,
+      "prefill_ms": 292.79,
+      "decode_step_ms": 78.899,
+      "agg_decode_tok_s": 12.7,
+      "per_user_tok_s": 12.7,
+      "status": "OK"
+    },
+    {
+      "B": 1,
+      "S": 2048,
+      "bucket_S": 2048,
+      "prefill_ms": 480.02,
+      "decode_step_ms": 78.453,
+      "agg_decode_tok_s": 12.7,
+      "per_user_tok_s": 12.7,
+      "status": "OK"
+    },
+    {
+      "B": 1,
+      "S": 4096,
+      "bucket_S": 4096,
+      "prefill_ms": 1058.17,
+      "decode_step_ms": 78.53,
+      "agg_decode_tok_s": 12.7,
+      "per_user_tok_s": 12.7,
+      "status": "OK"
+    }
+  ]
+}

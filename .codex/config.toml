@@ -7,3 +7,6 @@ MODEL_NAME = "google/gemma-4-31B-it"
 ACCELERATOR_TYPE = "v6e-8"
 TENSOR_PARALLEL_SIZE = "8"
 GOOGLE_CLOUD_PROJECT = "aisprint-491218"
+
+[mcp_servers.tpu-devops.tools.find_tpu_vm]
+approval_mode = "approve"
